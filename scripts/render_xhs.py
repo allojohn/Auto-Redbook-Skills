@@ -32,17 +32,23 @@ def generate_cover_html(metadata: dict, theme: str, body_text: str = "") -> str:
     emoji = metadata.get('emoji', '')
     title = metadata.get('title', '标题')
     subtitle = metadata.get('subtitle', '')
-    body_html = markdown.markdown(body_text, extensions=['extra', 'nl2br']) if body_text else ""
     
+    # 简单解析副标题中的加粗语法
+    subtitle_html = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', subtitle)
+    
+    body_html = markdown.markdown(body_text, extensions=['extra', 'nl2br']) if body_text else ""
     t_size = 120 if len(title) <= 6 else 100 if len(title) <= 10 else 80 if len(title) <= 18 else 65
     s_size = 72 if len(subtitle) <= 12 else 60 if len(subtitle) <= 20 else 48
-    
-    bg = "linear-gradient(180deg, #0D1117 0%, #21262D 100%)" if theme == 'terminal' else "linear-gradient(180deg, #f3f3f3 0%, #f9f9f9 100%)"
-    t_color = "#39d353" if theme == 'terminal' else "#111"
-    s_color = "#888" if theme == 'terminal' else "#333"
+    backgrounds = {
+        'default': 'linear-gradient(180deg, #f3f3f3 0%, #f9f9f9 100%)',
+        'terminal': 'linear-gradient(180deg, #0D1117 0%, #21262D 100%)',
+        'professional': 'linear-gradient(180deg, #2563EB 0%, #3B82F6 100%)'
+    }
+    bg = backgrounds.get(theme, backgrounds['default'])
+    t_color = "#39d353" if theme == 'terminal' else "#1e40af" if theme == 'professional' else "#111"
+    s_color = "#888" if theme == 'terminal' else "#475569" if theme == 'professional' else "#333"
     inner_bg = "#0d1117" if theme == 'terminal' else "#F3F3F3"
     border_color = "#333" if theme == 'terminal' else "#ddd"
-    
     return f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head><meta charset="UTF-8"><style>
@@ -53,14 +59,15 @@ body{{font-family:"Noto Sans SC",sans-serif;width:1080px;height:1440px;overflow:
 .inner{{background:{inner_bg};border-radius:25px;height:1310px;display:flex;flex-direction:column;padding:80px;box-shadow:0 10px 40px rgba(0,0,0,0.3);}}
 .emoji{{font-size:150px;margin-bottom:30px;}}
 .title{{font-weight:900;font-size:{t_size}px;line-height:1.3;color:{t_color};margin-bottom:20px; word-wrap:break-word; overflow-wrap:break-word;}}
-.subtitle{{font-weight:400;font-size:{s_size}px;color:{s_color};margin-bottom:50px;padding-bottom:20px;border-bottom:2px solid {border_color}; word-wrap:break-word; overflow-wrap:break-word;}}
-.cover-body{{flex:1;font-size:38px;line-height:1.6;color:#ccc;overflow:hidden; word-wrap:break-word; overflow-wrap:break-word;}}
+.subtitle{{font-weight:400;font-size:{s_size}px;color:{s_color};margin-bottom:30px;padding-bottom:20px;border-bottom:2px solid {border_color}; word-wrap:break-word; overflow-wrap:break-word;}}
+.subtitle strong {{color:{t_color};font-weight:700;}}
+.cover-body{{margin-top:80px; flex:1;font-size:38px;line-height:1.6;color:#ccc;overflow:hidden; word-wrap:break-word; overflow-wrap:break-word;}}
 .cover-body p{{margin-bottom:20px;}}
 .cover-body strong{{color:#39d353;font-weight:700;}}
 </style></head><body><div class="container"><div class="inner">
 {f'<div class="emoji">{emoji}</div>' if emoji else ""}
 <div class="title">{title}</div>
-{f'<div class="subtitle">{subtitle}</div>' if subtitle else ""}
+{f'<div class="subtitle">{subtitle_html}</div>' if subtitle_html else ""}
 <div class="cover-body">{body_html}</div>
 </div></div></body></html>'''
 
@@ -96,19 +103,26 @@ body{{font-family:"Noto Sans SC",sans-serif;width:1080px;height:1440px;overflow:
 .page-num{{position:absolute;bottom:60px;right:80px;font-size:32px;color:#555;font-weight:700;}}
 </style></head><body><div class="container"><div class="inner"><div class="content">{html_body}</div></div><div class="page-num">{page_num}/{total}</div></div></body></html>'''
 
-async def split_content(body: str, theme: str) -> List[str]:
+async def split_content(body: str, theme: str, metadata: dict) -> List[str]:
     async with async_playwright() as p:
         browser = await p.chromium.launch()
         page = await browser.new_page(viewport={'width': 1080, 'height': 1440})
         
-        async def fits(text):
+        async def fits_card(text):
             if not text.strip(): return True
             await page.set_content(generate_card_html(text, theme, 1, 1))
             # 极限高度探测，1220px为安全边界
             return await page.evaluate("document.querySelector('.content').scrollHeight <= 1220")
 
+        async def fits_cover(text):
+            if not text.strip(): return True
+            await page.set_content(generate_cover_html(metadata, theme, text))
+            # 测量 cover-body 内部内容是否溢出
+            return await page.evaluate("document.querySelector('.cover-body').scrollHeight <= document.querySelector('.cover-body').clientHeight")
+
         cards = []
         current_text = ""
+        is_filling_cover = True
         
         # 1. 拆分为 Markdown 段落块
         paragraphs = body.split('\n\n')
@@ -117,7 +131,9 @@ async def split_content(body: str, theme: str) -> List[str]:
             connector = "\n\n" if current_text else ""
             test_text = current_text + connector + para
             
-            if await fits(test_text):
+            fits_func = fits_cover if is_filling_cover else fits_card
+            
+            if await fits_func(test_text):
                 current_text = test_text
             else:
                 # 2. 如果段落放不下，拆分为行
@@ -126,11 +142,10 @@ async def split_content(body: str, theme: str) -> List[str]:
                     line_connector = "\n\n" if current_text and i == 0 else ("\n" if current_text else "")
                     test_line = current_text + line_connector + line
                     
-                    if await fits(test_line):
+                    if await fits_func(test_line):
                         current_text = test_line
                     else:
                         # 3. 如果连一行都放不下，按标点符号拆分为短语 (逗号, 句号等)
-                        # 这样可以像倒沙子一样填满最后的空间
                         segments = re.split(r'([。！？；，,.]\s*)', line)
                         phrases = []
                         tmp = ""
@@ -145,16 +160,20 @@ async def split_content(body: str, theme: str) -> List[str]:
                             phrase_connector = line_connector if j == 0 else ""
                             test_phrase = current_text + phrase_connector + phrase
                             
-                            if await fits(test_phrase):
+                            if await fits_func(test_phrase):
                                 current_text = test_phrase
                             else:
-                                # 卡片彻底满了，封版
+                                # 当前卡片（封面或正文）彻底满了，封版
                                 if current_text:
                                     cards.append(current_text)
+                                    is_filling_cover = False
+                                    fits_func = fits_cover if is_filling_cover else fits_card
                                     current_text = phrase # 溢出部分放到下一张卡片
                                 else:
                                     # 极端异常：连一个短语都超出一整页
                                     cards.append(phrase)
+                                    is_filling_cover = False
+                                    fits_func = fits_cover if is_filling_cover else fits_card
                                     current_text = ""
         
         if current_text:
@@ -166,27 +185,31 @@ async def split_content(body: str, theme: str) -> List[str]:
 async def main_task(md_file, output_dir, theme):
     os.makedirs(output_dir, exist_ok=True)
     data = parse_markdown_file(md_file)
-    print(f"🎨 执行 Github 级排版 + 标点贪婪填充...")
-    card_contents = await split_content(data['body'], theme)
-    total = len(card_contents)
-    is_single_page = total == 1 and len(card_contents[0]) < 600
+    metadata = data.get('metadata', {})
+    print(f"🎨 执行 Github 级排版 + 封面无缝流转贪婪填充...")
+    
+    card_contents = await split_content(data['body'], theme, metadata)
+    
+    # 数组的第 0 项是封面的内容，后面的才是正文卡片
+    cover_text = card_contents[0] if len(card_contents) > 0 else ""
+    normal_cards = card_contents[1:] if len(card_contents) > 1 else []
+    total = len(normal_cards)
     
     async with async_playwright() as p:
         browser = await p.chromium.launch()
         page = await browser.new_page(viewport={'width': 1080, 'height': 1440})
         
-        if metadata := data.get('metadata'):
-            if is_single_page:
-                await page.set_content(generate_cover_html(metadata, theme, body_text=card_contents[0]))
-                await page.screenshot(path=os.path.join(output_dir, "cover.png"))
-                print("  ✅ 已生成单图 (cover.png)"); await browser.close(); return
-            await page.set_content(generate_cover_html(metadata, theme))
-            await page.screenshot(path=os.path.join(output_dir, "cover.png"))
+        # 无论是不是单图模式，都生成封面（此时封面已精确吸纳了能放下的最大字数）
+        await page.set_content(generate_cover_html(metadata, theme, body_text=cover_text))
+        await page.screenshot(path=os.path.join(output_dir, "cover.png"))
+        print("  ✅ 已生成封面 (cover.png)")
             
-        for i, content in enumerate(card_contents, 1):
+        # 如果还有剩余内容，生成正常的正文卡片
+        for i, content in enumerate(normal_cards, 1):
             await page.set_content(generate_card_html(content, theme, i, total))
             await page.screenshot(path=os.path.join(output_dir, f"card_{i}.png"))
             print(f"  ✅ 卡片 {i}/{total} 已生成")
+            
         await browser.close()
 
 if __name__ == "__main__":
